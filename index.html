@@ -1991,17 +1991,24 @@ function extrairCNIS(t) {
     var seqMAntigo = linha.match(/^(\d{1,2})\s+[\d\.\-]{6,}\s+(.{3,}?)\s+(Empregad|Contribuin)/i);
     
     var seq = null, empresaEncontrada = null, tipoVinculo = null;
-    // Lookahead adaptativo: parte de 30 linhas mas tenta encontrar o próximo "Seq N+1"
+    // Lookahead adaptativo: parte de 30 linhas mas tenta encontrar o próximo "Seq N+k"
     // ou um cabeçalho de seção para reduzir. Evita que dados do vínculo seguinte
     // contaminem o vínculo atual (bug conhecido do COTRIN/SALOBO).
+    // Agora tolera GAPS: aceita qualquer seq de 1..15 à frente como próximo.
     var lookAheadFim = Math.min(li + 30, linhas.length);
     var seqAtual = seqMAntigo ? parseInt(seqMAntigo[1]) : (seqM ? parseInt(seqM[1]) : 0);
     if (seqAtual > 0) {
       for (var pa = li + 1; pa < lookAheadFim; pa++) {
         var lpa = linhas[pa];
         if (!lpa) continue;
-        // Próximo Seq esperado (monotônico)
-        if (lpa === String(seqAtual + 1)) { lookAheadFim = pa; break; }
+        // Próximo seq com gap — aceita qualquer número > seqAtual e ≤ seqAtual+15
+        var mProx = lpa.match(/^(\d{1,2})$/);
+        if (mProx) {
+          var nProx = parseInt(mProx[1]);
+          if (nProx > seqAtual && nProx <= seqAtual + 15) {
+            lookAheadFim = pa; break;
+          }
+        }
         // Cabeçalho de outra seção do CNIS
         if (/^(Rela[çc][õo]es|Periodos|Contribui[çc][õo]es|Remunera|V[íi]nculos|Totais?|Benef[íi]cios?|Resumo)/i.test(lpa)) {
           lookAheadFim = pa; break;
@@ -2016,8 +2023,14 @@ function extrairCNIS(t) {
         ? 'Empregado/Agente Publico' : 'Contribuinte Individual';
     } else if (seqM) {
       seq = parseInt(seqM[1]);
-      // Verifica se faz sentido como próximo seq (monotônico crescente)
-      if (seq !== ultimoSeq + 1) continue;
+      // Validação relaxada: aceita seq monotônico crescente MAS com gaps (1,2,4,7…)
+      // Rejeita só se for menor ou igual ao último já visto (evita que "05/2024" aparecendo
+      // como competência seja confundido com seq 5 se já passou do 10).
+      // Isso resolve o caso em que o primeiro seq detectado é > 1 (ex: 3, porque o 1 e 2
+      // estavam em layout diferente), e o caso de seqs com gaps no CNIS.
+      if (seq <= ultimoSeq) continue;
+      // Limite absoluto: não pode saltar mais de 15 posições de uma vez (evita falsos positivos)
+      if (seq > ultimoSeq + 15) continue;
       // Procura linhas seguintes para validar: deve ter NIT-like + empregador + Empregado/Contribuinte
       var bloco = linhas.slice(li, lookAheadFim).join(' ');
       if (!/Empregad|Contribuin|Benef[ií]cio/i.test(bloco)) continue;

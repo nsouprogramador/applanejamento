@@ -353,6 +353,43 @@ input:focus, select:focus, textarea:focus {
   top: 0; left: 0; right: 0; height: 3px;
   background: linear-gradient(90deg, var(--gold), transparent);
 }
+.p3-status-ref-badge {
+  padding: 6px 18px;
+  background: rgba(201,168,76,.06);
+  border-bottom: 1px dashed var(--border);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted2);
+  letter-spacing: .04em;
+}
+.p3-status-ref-badge strong { color: var(--gold); }
+.p3-status-ref-badge.nao-hoje {
+  background: rgba(61,127,255,.08);
+  border-bottom-color: rgba(61,127,255,.25);
+  color: var(--blue);
+}
+.p3-status-ref-badge.nao-hoje strong { color: var(--blue); }
+
+.p3-status-toggle {
+  padding: 8px 18px;
+  background: rgba(240,160,48,.04);
+  border-bottom: 1px dashed var(--border);
+}
+.p3-status-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--muted2);
+  line-height: 1.4;
+}
+.p3-status-toggle-label:hover { color: var(--text); }
+.p3-status-toggle-label input[type=checkbox] {
+  accent-color: var(--amber);
+  cursor: pointer;
+  flex-shrink: 0;
+}
 .p3-status-head {
   padding: 18px 22px;
   display: grid;
@@ -1828,6 +1865,9 @@ function tipoSegurado(vinculos) {
 
 function contribuicaoValida(comp) {
   if (!comp || !comp.comp) return false;
+  // Período de benefício (art. 55, II Lei 8.213/91) — conta para TC e carência
+  // independente de valor (o instituto recolheu sobre o salário-benefício)
+  if (comp._origemBeneficio || /\bBENEF\b/.test(comp.indicadores || '')) return true;
   // Checa indicadores inválidos
   var inds = comp.indicadores || '';
   for (var ki = 0; ki < INDICADORES_INVALIDOS.length; ki++) {
@@ -2114,6 +2154,109 @@ function extrairCNIS(t) {
     return arr.findIndex(function(x) { return x.seq === v.seq; }) === idx2;
   });
 
+  // ── BENEFÍCIOS (art. 55, II Lei 8.213/91) ──
+  // Períodos de auxílio-doença, invalidez e outros registrados como
+  // "Benefício" no CNIS. Precisa identificar DIB (início) e DCB/cessação (fim).
+  // Estratégia: procura padrões de NB (número de benefício), espécies conhecidas
+  // e datas associadas. Gera competências virtuais para TC e carência.
+  d._beneficios = [];
+  (function parseBeneficios() {
+    var textoCompleto = T;
+
+    // Espécies mais comuns no CNIS (lista não-exaustiva)
+    var especies = {
+      '21':  'Auxílio-doença previdenciário',
+      '31':  'Auxílio-doença previdenciário',
+      '91':  'Auxílio-doença acidentário',
+      '32':  'Aposentadoria por invalidez previdenciária',
+      '92':  'Aposentadoria por invalidez acidentária',
+      '41':  'Aposentadoria por idade',
+      '42':  'Aposentadoria por tempo de contribuição',
+      '46':  'Aposentadoria especial',
+      '57':  'Aposentadoria por invalidez (LOAS antiga)',
+      '80':  'Salário-maternidade',
+      '81':  'Pensão por morte (prev.)',
+      '21':  'Auxílio por incapacidade temporária',
+    };
+
+    // Padrão 1: NB N.N.N.N.N.N.N / DIB DD/MM/YYYY / DCB DD/MM/YYYY
+    // Padrão 2: blocos "Benefícios" com espécie + dois pares de datas
+    // Usa regex com contexto amplo e tolerante a quebras de linha
+    var padroes = [
+      // NB + espécie + DIB + DCB com ordem flexível
+      /NB[\s:]*([\d\.]+)[\s\S]{0,200}?Esp[ée]cie[\s:]*(\d{1,3})[\s\S]{0,200}?(?:DIB|In[íi]cio)[\s:]*(\d{2}\/\d{2}\/\d{4})[\s\S]{0,200}?(?:DCB|Fim|Cessa)[\s:]*(\d{2}\/\d{2}\/\d{4})/gi,
+      // Espécie + duas datas em linha
+      /Esp[ée]cie[\s:]*(\d{1,3})[^\n]{0,80}?(\d{2}\/\d{2}\/\d{4})[^\n]{0,40}?(\d{2}\/\d{2}\/\d{4})/gi,
+    ];
+
+    var capturados = {};
+    padroes.forEach(function(re) {
+      var m;
+      while ((m = re.exec(textoCompleto)) !== null) {
+        var nb, esp, dib, dcb;
+        if (m.length >= 5) { // padrão 1
+          nb = m[1]; esp = m[2]; dib = m[3]; dcb = m[4];
+        } else { // padrão 2
+          esp = m[1]; dib = m[2]; dcb = m[3]; nb = '';
+        }
+        var chave = (nb || '') + '|' + esp + '|' + dib + '|' + dcb;
+        if (capturados[chave]) continue;
+        capturados[chave] = true;
+        var nomeEsp = especies[esp] || ('Benefício código ' + esp);
+        d._beneficios.push({
+          nb: nb || null,
+          especie: esp,
+          especieNome: nomeEsp,
+          dib: dib,
+          dcb: dcb,
+          _origemCnis: true,
+        });
+      }
+    });
+
+    // Log para debug
+    if (d._beneficios.length) {
+      console.log('[CNIS] Benefícios detectados:', d._beneficios.length, d._beneficios);
+    }
+  })();
+
+  // Gera competências virtuais para cada mês do benefício
+  // (Art. 55, II Lei 8.213/91: benefícios por incapacidade contam para TC.
+  //  Aqui, conforme escolha do usuário, contam também para carência.)
+  function _gerarCompetenciasBenef(beneficios) {
+    function pd(s) {
+      var p = (s || '').split('/');
+      if (p.length !== 3) return null;
+      return new Date(parseInt(p[2]), parseInt(p[1]) - 1, parseInt(p[0]));
+    }
+    var lista = [];
+    beneficios.forEach(function(b) {
+      var ini = pd(b.dib);
+      var fim = pd(b.dcb);
+      if (!ini || !fim) return;
+      var cur = new Date(ini.getFullYear(), ini.getMonth(), 1);
+      var end = new Date(fim.getFullYear(), fim.getMonth(), 1);
+      while (cur <= end) {
+        var m = cur.getMonth() + 1, y = cur.getFullYear();
+        var compStr = (m < 10 ? '0' : '') + m + '/' + y;
+        lista.push({
+          comp: compStr,
+          valor: 0, // benefício não tem SC próprio — usar média histórica
+          indicadores: 'BENEF',
+          empresa: 'INSS — ' + b.especieNome + (b.nb ? ' (NB ' + b.nb + ')' : ''),
+          tipoVinculo: 'Beneficio',
+          tipoContribuicao: 'beneficio',
+          _origemBeneficio: true,
+          _nbRef: b.nb,
+          _especieRef: b.especie,
+        });
+        cur.setMonth(cur.getMonth() + 1);
+      }
+    });
+    return lista;
+  }
+  var compsBenef = _gerarCompetenciasBenef(d._beneficios);
+
   // ── COMPETÊNCIAS — busca robusta ──
   // O regex atual funciona, mantém
   var compRe = /(\d{2}\/\d{4})\s+([\d\.,]+)(?:\s+([A-Z][^\n\d]{2,80}?))?(?=\s+\d{2}\/|\s*$|\s+\d{2}\/\d{4})/g;
@@ -2133,6 +2276,13 @@ function extrairCNIS(t) {
   // Dedup por competência (mantém último registro)
   var compMap = {};
   d._contribuicoesDetalhadas.forEach(function(c) { compMap[c.comp] = c; });
+
+  // Adiciona competências de benefício SE ainda não houver contribuição real
+  // naquele mês (contribuição real tem prioridade sobre período de benefício)
+  compsBenef.forEach(function(cb) {
+    if (!compMap[cb.comp]) compMap[cb.comp] = cb;
+  });
+
   d._contribuicoesDetalhadas = Object.values(compMap).sort(function(a, b) {
     var pa = a.comp.split('/'), pb = b.comp.split('/');
     return (parseInt(pa[1]) * 12 + parseInt(pa[0])) - (parseInt(pb[1]) * 12 + parseInt(pb[0]));
@@ -3181,6 +3331,10 @@ function _calcularQualidadeSegurado(ctx) {
   if (totalContribAteDer >= 120) gracaBase = 24;
   var gracaMaxComDesemprego = gracaBase + 12;
 
+  // Se advogado marcou "desemprego comprovado", a graça efetiva é a estendida
+  var usarExtensao = !!window._apEstadoDesemprego;
+  var gracaEfetiva = usarExtensao ? gracaMaxComDesemprego : gracaBase;
+
   if (mesesDesde <= gracaBase) {
     var restam = gracaBase - mesesDesde;
     return {
@@ -3192,16 +3346,25 @@ function _calcularQualidadeSegurado(ctx) {
 
   if (mesesDesde <= gracaMaxComDesemprego) {
     var restam2 = gracaMaxComDesemprego - mesesDesde;
+    if (usarExtensao) {
+      // Advogado marcou desemprego: conta como graça ATIVA
+      return {
+        status: 'graca',
+        desc: 'Graça ESTENDIDA por desemprego comprovado na DER (' + _fmtData(ref) + '). Última contribuição: ' + _fmtData(ultimaData) + '. Restam ' + restam2 + ' meses (art. 15, §2º Lei 8.213/91).',
+        meta: 'GRAÇA +12m DESEMPREGO — RESTAM ' + restam2 + ' MESES',
+      };
+    }
+    // Sem marcação: indica só que a extensão é possível
     return {
       status: 'graca',
-      desc: 'Graça prorrogada possível na DER (' + _fmtData(ref) + ') — requer comprovação de desemprego no Ministério do Trabalho/SINE. Última contribuição: ' + _fmtData(ultimaData) + '. Máximo ' + restam2 + ' meses se comprovado.',
+      desc: 'Graça prorrogada possível na DER (' + _fmtData(ref) + ') — requer comprovação de desemprego no Ministério do Trabalho/SINE. Última contribuição: ' + _fmtData(ultimaData) + '. Máximo ' + restam2 + ' meses se comprovado. Marque "Desemprego comprovado" no card acima para aplicar.',
       meta: 'GRAÇA ESTENDIDA — COMPROVAR DESEMPREGO',
     };
   }
 
   return {
     status: 'perdeu',
-    desc: 'Qualidade de segurado PERDIDA na DER (' + _fmtData(ref) + '). Última contribuição: ' + _fmtData(ultimaData) + ' (' + mesesDesde + ' meses antes da DER). Para recuperar: contribuir 6 meses (metade da carência) para benefícios por incapacidade.',
+    desc: 'Qualidade de segurado PERDIDA na DER (' + _fmtData(ref) + ').' + (usarExtensao ? ' Mesmo com desemprego comprovado (+12 meses), o prazo de ' + gracaMaxComDesemprego + 'm foi ultrapassado.' : '') + ' Última contribuição: ' + _fmtData(ultimaData) + ' (' + mesesDesde + ' meses antes da DER). Para recuperar: contribuir 6 meses (metade da carência) para benefícios por incapacidade.',
     meta: mesesDesde + ' MESES SEM CONTRIBUIR',
   };
 }
@@ -4738,8 +4901,32 @@ function _renderStatus(ctx, qualidade, resultados) {
     statusDesc = qualidade.desc;
   }
 
+  // Badge explicitando a data de referência
+  var derStr = _fmtData(ctx.der);
+  var ehHoje = ctx.der.toDateString() === (ctx.hoje || new Date()).toDateString();
+  var badgeDer = '<div class="p3-status-ref-badge' + (ehHoje ? '' : ' nao-hoje') + '">'
+    + '📅 calculado para <strong>' + derStr + '</strong>'
+    + (ehHoje ? ' (hoje)' : ' (DER em análise)')
+    + '</div>';
+
+  // Toggle de desemprego comprovado (só faz sentido se NÃO tem vínculo ativo)
+  var desempregoOn = !!window._apEstadoDesemprego;
+  var toggleDes = '';
+  // Só mostra o toggle se a qualidade é "graca" ou "perdeu" (não faz sentido com vínculo ativo)
+  if (qualidade.status === 'graca' || qualidade.status === 'perdeu') {
+    toggleDes = ''
+      + '<div class="p3-status-toggle">'
+      + '  <label class="p3-status-toggle-label">'
+      + '    <input type="checkbox" ' + (desempregoOn ? 'checked' : '') + ' onchange="window._apPlanToggleDesemprego(this.checked)">'
+      + '    <span>Desemprego comprovado (SINE/MTE) — estende graça em +12 meses (art. 15, §2º Lei 8.213/91)</span>'
+      + '  </label>'
+      + '</div>';
+  }
+
   return ''
     + '<div class="p3-status-card">'
+    + badgeDer
+    + toggleDes
     + '  <div class="p3-status-head">'
     + '    <div class="p3-status-icon ' + statusClass + '">' + statusIcon + '</div>'
     + '    <div>'
@@ -5139,6 +5326,11 @@ window._apPlanToggleSecao = function(id) {
     var sid = s.dataset.secaoId;
     s.classList.toggle('aberta', sid === _estado.secaoAberta);
   });
+};
+// Toggle de desemprego comprovado — estende graça em 12m
+window._apPlanToggleDesemprego = function(ativo) {
+  window._apEstadoDesemprego = !!ativo;
+  window.renderPlanejamento();
 };
 window._apPlanToggleDetalhe = function(idx) {
   var el = document.getElementById('p3-det-' + idx);
@@ -9643,6 +9835,15 @@ console.log('[A&P Plan] Módulo Didáticas v1 carregado');
   color: var(--muted);
   font-style: italic;
 }
+.p3-contrib-empresa.manual-emp {
+  color: var(--blue);
+}
+/* Indicador visual para competências oriundas de benefício */
+.p3-contrib-ind.benef {
+  color: #b66dff;
+  border-color: rgba(182, 109, 255, .4);
+  background: rgba(182, 109, 255, .08);
+}
 
 .p3-contrib-acoes {
   display: inline-flex;
@@ -9715,6 +9916,17 @@ console.log('[A&P Plan] Módulo Didáticas v1 carregado');
   max-height: 90vh;
   overflow-y: auto;
   box-shadow: 0 20px 60px rgba(0,0,0,.6);
+}
+.p3-modal.p3-modal-lg { max-width: 640px; }
+.p3-modal-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.p3-modal-row .p3-modal-grupo { margin-bottom: 0; }
+@media (max-width: 640px) {
+  .p3-modal-row { grid-template-columns: 1fr; gap: 0; }
+  .p3-modal-row .p3-modal-grupo { margin-bottom: 14px; }
 }
 .p3-modal-head {
   padding: 16px 20px;
@@ -9864,6 +10076,7 @@ var INDICADORES_TIPOS = [
   { key: 'IREC-LIM-SM',      label: 'IREC-LIM-SM',         css: 'lim',   desc: 'Limit. SM' },
   { key: 'PSC-MEN-SM-EC103', label: 'PSC-MEN-SM (< SM)',   css: 'psc',   desc: '< SM (inv.)' },
   { key: 'PREC-MENOR-MIN',   label: 'PREC-MENOR-MIN',      css: 'prec',  desc: '< mínimo' },
+  { key: 'BENEF',            label: 'BENEF (período INSS)',css: 'benef', desc: 'Benefício' },
 ];
 
 // Estado (ficam no window p/ handlers inline conseguirem acessar)
@@ -10042,18 +10255,27 @@ function _renderTabela() {
       + (invalida ? '✗ inválida' : '✓ válida') + '</span>';
 
     // Empresa / Vínculo
-    var vinc = _vinculoDaComp(c.comp);
     var empresaHtml;
-    if (vinc) {
-      var resumo = _empresaResumo(vinc.empresa);
-      var completo = (vinc.seq ? '#' + vinc.seq + ' ' : '') + (vinc.empresa || '')
-        + (vinc.inicio ? ' · ' + vinc.inicio + ' → ' + (vinc.fim || 'em aberto') : '');
-      empresaHtml = '<span class="p3-contrib-empresa" title="' + _esc(completo) + '">'
-        + (vinc.seq ? '<span class="p3-contrib-empresa-seq">#' + _esc(vinc.seq) + '</span> ' : '')
-        + _esc(resumo)
+    // Prioridade: empresa salva no próprio registro (manual ou editada) → vínculo do CNIS
+    if (c.empresa) {
+      var resumoM = _empresaResumo(c.empresa);
+      var completoM = c.empresa + (c.tipoVinculo ? ' · ' + c.tipoVinculo : '');
+      empresaHtml = '<span class="p3-contrib-empresa manual-emp" title="' + _esc(completoM) + '">'
+        + '📝 ' + _esc(resumoM)
         + '</span>';
     } else {
-      empresaHtml = '<span class="p3-contrib-empresa avulsa" title="Sem vínculo identificado">— avulsa</span>';
+      var vinc = _vinculoDaComp(c.comp);
+      if (vinc) {
+        var resumo = _empresaResumo(vinc.empresa);
+        var completo = (vinc.seq ? '#' + vinc.seq + ' ' : '') + (vinc.empresa || '')
+          + (vinc.inicio ? ' · ' + vinc.inicio + ' → ' + (vinc.fim || 'em aberto') : '');
+        empresaHtml = '<span class="p3-contrib-empresa" title="' + _esc(completo) + '">'
+          + (vinc.seq ? '<span class="p3-contrib-empresa-seq">#' + _esc(vinc.seq) + '</span> ' : '')
+          + _esc(resumo)
+          + '</span>';
+      } else {
+        empresaHtml = '<span class="p3-contrib-empresa avulsa" title="Sem vínculo identificado">— avulsa</span>';
+      }
     }
 
     var compEsc = _esc(c.comp).replace(/'/g, "\\'");
@@ -10174,6 +10396,39 @@ function _renderModal(dados, avisoDup) {
       + '</label>';
   }).join('');
 
+  // Tipos de vínculo (Lei 8.213/91 art. 11 e art. 13)
+  var tiposVinculo = [
+    { v: 'Empregado/Agente Publico',   l: 'Empregado / Agente Público' },
+    { v: 'Empregado Domestico',         l: 'Empregado Doméstico' },
+    { v: 'Contribuinte Individual',     l: 'Contribuinte Individual (autônomo/MEI)' },
+    { v: 'Facultativo',                 l: 'Facultativo' },
+    { v: 'Segurado Especial',           l: 'Segurado Especial (rural)' },
+    { v: 'Trabalhador Avulso',          l: 'Trabalhador Avulso' },
+    { v: 'Beneficio',                   l: 'Benefício (auxílio-doença, etc.)' },
+  ];
+  var vincAtual = dados.tipoVinculo || '';
+  var optsVinc = '<option value="">— não especificado —</option>'
+    + tiposVinculo.map(function(t) {
+        return '<option value="' + _esc(t.v) + '"' + (vincAtual === t.v ? ' selected' : '') + '>' + _esc(t.l) + '</option>';
+      }).join('');
+
+  // Tipos de contribuição (alíquotas)
+  var tiposContrib = [
+    { v: '20',       l: '20% — CI normal' },
+    { v: '11',       l: '11% — LC 123 / fac. baixa renda' },
+    { v: '5',        l: '5% — MEI' },
+    { v: 'empregado',l: 'Empregado (recolhe empresa)' },
+    { v: 'rural',    l: 'Segurado Especial (rural, sobre comercialização)' },
+    { v: 'beneficio',l: 'Período de benefício (não contributivo)' },
+  ];
+  var aliqAtual = dados.tipoContribuicao || '';
+  var optsAliq = '<option value="">— automático (por indicador) —</option>'
+    + tiposContrib.map(function(t) {
+        return '<option value="' + _esc(t.v) + '"' + (aliqAtual === t.v ? ' selected' : '') + '>' + _esc(t.l) + '</option>';
+      }).join('');
+
+  var empAtual = dados.empresa || '';
+
   var avisoHtml = '';
   if (avisoDup) {
     avisoHtml = ''
@@ -10189,23 +10444,39 @@ function _renderModal(dados, avisoDup) {
 
   return ''
     + '<div class="p3-modal-overlay" onclick="if(event.target===this)window._apContribFecharModal()">'
-    + '  <div class="p3-modal">'
+    + '  <div class="p3-modal p3-modal-lg">'
     + '    <div class="p3-modal-head">'
     + '      <div class="p3-modal-titulo">' + titulo + '</div>'
     + '      <button class="p3-modal-fechar" onclick="window._apContribFecharModal()">✕</button>'
     + '    </div>'
     + '    <div class="p3-modal-body">'
     + avisoHtml
-    + '      <div class="p3-modal-grupo">'
-    + '        <label class="p3-modal-label">Competência (MM/AAAA)</label>'
-    + '        <input id="p3-modal-comp" class="p3-modal-input" type="text" value="' + _esc(dados.comp || '') + '" placeholder="01/2025" maxlength="7" ' + (isEdit ? 'readonly' : '') + '>'
+    + '      <div class="p3-modal-row">'
+    + '        <div class="p3-modal-grupo">'
+    + '          <label class="p3-modal-label">Competência (MM/AAAA)</label>'
+    + '          <input id="p3-modal-comp" class="p3-modal-input" type="text" value="' + _esc(dados.comp || '') + '" placeholder="01/2025" maxlength="7" ' + (isEdit ? 'readonly' : '') + '>'
+    + '        </div>'
+    + '        <div class="p3-modal-grupo">'
+    + '          <label class="p3-modal-label">Valor da contribuição (R$)</label>'
+    + '          <input id="p3-modal-valor" class="p3-modal-input" type="text" value="' + (dados.valor || '') + '" placeholder="1100,00">'
+    + '        </div>'
     + '      </div>'
     + '      <div class="p3-modal-grupo">'
-    + '        <label class="p3-modal-label">Valor da contribuição (R$)</label>'
-    + '        <input id="p3-modal-valor" class="p3-modal-input" type="text" value="' + (dados.valor || '') + '" placeholder="1100,00">'
+    + '        <label class="p3-modal-label">Empresa / Origem (opcional)</label>'
+    + '        <input id="p3-modal-empresa" class="p3-modal-input" type="text" value="' + _esc(empAtual) + '" placeholder="Ex: EMPRESA ALFA LTDA / Carnê autônomo / INSS-auxílio doença" maxlength="80">'
+    + '      </div>'
+    + '      <div class="p3-modal-row">'
+    + '        <div class="p3-modal-grupo">'
+    + '          <label class="p3-modal-label">Tipo de vínculo</label>'
+    + '          <select id="p3-modal-vinc" class="p3-modal-input">' + optsVinc + '</select>'
+    + '        </div>'
+    + '        <div class="p3-modal-grupo">'
+    + '          <label class="p3-modal-label">Alíquota / Tipo de contribuição</label>'
+    + '          <select id="p3-modal-aliq" class="p3-modal-input">' + optsAliq + '</select>'
+    + '        </div>'
     + '      </div>'
     + '      <div class="p3-modal-grupo">'
-    + '        <label class="p3-modal-label">Indicadores (opcionais)</label>'
+    + '        <label class="p3-modal-label">Indicadores técnicos (CNIS)</label>'
     + '        <div class="p3-modal-checks">' + checksHtml + '</div>'
     + '      </div>'
     + '    </div>'
@@ -10272,16 +10543,29 @@ window._apContribAbrirModal = function(comp) {
     // Editar existente
     var achou = cnis._contribuicoesDetalhadas.find(function(c) { return c.comp === comp; });
     if (!achou) return;
+    // Se não tem empresa própria mas está dentro de um vínculo, usa o nome do vínculo como default
+    var empDefault = achou.empresa || '';
+    if (!empDefault && typeof _vinculoDaComp === 'function') {
+      var v = _vinculoDaComp(comp);
+      if (v && v.empresa) empDefault = v.empresa;
+    }
     window._apContribEditando = {
       comp: achou.comp,
       valor: achou.valor,
       indicadores: _indicadoresStr(achou),
+      empresa: empDefault,
+      tipoVinculo: achou.tipoVinculo || (typeof _vinculoDaComp === 'function' && _vinculoDaComp(comp) ? _vinculoDaComp(comp).tipo : '') || '',
+      tipoContribuicao: achou.tipoContribuicao || '',
       _origem: achou._origem || 'cnis',
       _original: achou,
       _isNew: false,
     };
   } else {
-    window._apContribEditando = { comp: '', valor: '', indicadores: '', _origem: 'manual', _isNew: true };
+    window._apContribEditando = {
+      comp: '', valor: '', indicadores: '',
+      empresa: '', tipoVinculo: '', tipoContribuicao: '',
+      _origem: 'manual', _isNew: true,
+    };
   }
   _abrirModalHTML(_renderModal(window._apContribEditando));
   setTimeout(function() {
@@ -10317,6 +10601,14 @@ window._apContribSalvar = function() {
   var valor = parseFloat(valorStr);
   if (isNaN(valor) || valor < 0) { alert('Valor inválido. Informe um número (ex: 1100 ou 1100,00).'); valorInput.focus(); return; }
 
+  // Novos campos
+  var empresaEl = document.getElementById('p3-modal-empresa');
+  var vincEl    = document.getElementById('p3-modal-vinc');
+  var aliqEl    = document.getElementById('p3-modal-aliq');
+  var empresa = empresaEl ? (empresaEl.value || '').trim() : '';
+  var tipoVinc = vincEl ? vincEl.value : '';
+  var tipoAliq = aliqEl ? aliqEl.value : '';
+
   // Coleta checkboxes
   var inds = [];
   document.querySelectorAll('.p3-modal-check input[type=checkbox]:checked').forEach(function(cb) {
@@ -10330,24 +10622,29 @@ window._apContribSalvar = function() {
     // Verifica duplicata
     var jaExiste = cnis._contribuicoesDetalhadas.find(function(c) { return c.comp === parsed.str; });
     if (jaExiste) {
-      // Re-renderiza modal com aviso
       _abrirModalHTML(_renderModal(window._apContribEditando, parsed.str));
       return;
     }
     // Adiciona
-    cnis._contribuicoesDetalhadas.push({
+    var novo = {
       comp: parsed.str,
       valor: valor,
       indicadores: inds.join(' '),
       _origem: 'manual',
-    });
+    };
+    if (empresa)  novo.empresa = empresa;
+    if (tipoVinc) novo.tipoVinculo = tipoVinc;
+    if (tipoAliq) novo.tipoContribuicao = tipoAliq;
+    cnis._contribuicoesDetalhadas.push(novo);
     toast('✓ Competência ' + parsed.str + ' adicionada');
   } else {
     // Edita existente
     var alvo = ed._original;
     alvo.valor = valor;
     alvo.indicadores = inds.join(' ');
-    // Se já era CNIS, marca como 'editada' (manteve origem mas foi alterada)
+    if (empresa)  alvo.empresa = empresa;       else delete alvo.empresa;
+    if (tipoVinc) alvo.tipoVinculo = tipoVinc;  else delete alvo.tipoVinculo;
+    if (tipoAliq) alvo.tipoContribuicao = tipoAliq; else delete alvo.tipoContribuicao;
     if (alvo._origem !== 'manual') alvo._origem = 'editada';
     toast('✓ Competência ' + parsed.str + ' atualizada');
   }

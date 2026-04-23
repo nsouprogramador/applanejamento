@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="description" content="A&P Planejamento Previdenciário — ferramenta para análise de CNIS, cálculo de RMI, regras de transição EC 103/2019 e simulação de complementação de alíquota.">
 <meta name="theme-color" content="#c9a84c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -40,11 +41,9 @@ if (typeof pdfjsLib !== 'undefined') {
   --sans:      'Outfit', sans-serif;
   --radius:    10px;
   --shadow:    0 4px 24px rgba(0,0,0,.5);
-}
-
-:root {
-  --ease:         cubic-bezier(.22,.61,.36,1);
-  --ease-swift:   cubic-bezier(.4,0,.2,1);
+  /* Easings e sombras extras */
+  --ease:       cubic-bezier(.22,.61,.36,1);
+  --ease-swift: cubic-bezier(.4,0,.2,1);
   --shadow-sm:  0 1px 2px rgba(0,0,0,.3), 0 1px 3px rgba(0,0,0,.2);
   --shadow-md:  0 2px 8px rgba(0,0,0,.35), 0 4px 16px rgba(0,0,0,.25);
   --shadow-lg:  0 8px 24px rgba(0,0,0,.4), 0 16px 48px rgba(0,0,0,.3);
@@ -166,7 +165,7 @@ input:focus, select:focus, textarea:focus {
   background: var(--surface2); border: 1px solid var(--border2);
 }
 
-#tab-planejamento { padding: 20px 22px 40px; max-width: 1100px; margin: 0 auto; }
+
 
 .toast {
   position: fixed; bottom: 24px; left: 50%;
@@ -199,7 +198,7 @@ input:focus, select:focus, textarea:focus {
 
 /* ═════ Reset + base do planejamento ═════ */
 #tab-planejamento {
-  padding: 20px 22px 40px !important;
+  padding: 24px 20px 40px;
   max-width: 1100px;
   margin: 0 auto;
 }
@@ -950,9 +949,7 @@ input:focus, select:focus, textarea:focus {
 <style>
 
 /* ═══ Planejamento — UI ═══ */
-#tab-planejamento {
-  padding: 24px 20px 40px;
-}
+/* #tab-planejamento já definido na seção base */
 .plan-header {
   background: linear-gradient(135deg,
     rgba(201,168,76,.08) 0%,
@@ -1647,6 +1644,13 @@ input:focus, select:focus, textarea:focus {
 </style>
 </head>
 <body>
+
+<noscript>
+  <div style="background:#e05252;color:#fff;padding:20px;text-align:center;font-family:sans-serif;font-size:15px;line-height:1.6;">
+    <strong>⚠ JavaScript desativado.</strong><br>
+    Esta ferramenta precisa de JavaScript para funcionar. Por favor, habilite JavaScript nas configurações do seu navegador e recarregue a página.
+  </div>
+</noscript>
 
 <!-- Painel de diagnóstico — executa automaticamente 1s após carregar -->
 <div id="ap-diag" style="display:none;background:#111827;color:#e8ecf5;padding:14px 22px;border-bottom:2px solid #c9a84c;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.7;">

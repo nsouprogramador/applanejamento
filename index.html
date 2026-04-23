@@ -3092,45 +3092,100 @@ function _calcularQualidadeSegurado(ctx) {
     return { status: 'indefinido', desc: 'Sem dados suficientes para determinar qualidade de segurado.' };
   }
 
-  var hoje = new Date();
-  var ultimaContrib = cnis._ultimaContribuicaoValida || cnis._ultimoVinculo;
-  var ultimaData = _parseComp(ultimaContrib);
+  // Data de referência: DER em análise (não "hoje real")
+  // Isso é crítico para benefícios não-programáveis — a qualidade importante
+  // é a da DATA DO EVENTO (afastamento, óbito, parto), não a de hoje.
+  var ref = (ctx.der instanceof Date && !isNaN(ctx.der)) ? ctx.der : new Date();
 
-  // Verifica se tem vínculo aberto (fim vazio ou "EM ABERTO")
+  // Recalcula "última contribuição VÁLIDA ATÉ A DER" em vez de usar o
+  // _ultimaContribuicaoValida global (que contempla contribuições posteriores à DER).
+  var ultimaData = null;
+  var ultimaComp = null;
+  if (cnis._contribuicoesDetalhadas && cnis._contribuicoesDetalhadas.length) {
+    cnis._contribuicoesDetalhadas.forEach(function(c) {
+      if (!c || !c.comp) return;
+      var parts = c.comp.split('/');
+      if (parts.length !== 2) return;
+      var dc = new Date(parseInt(parts[1]), parseInt(parts[0]) - 1, 15);
+      if (dc > ref) return; // só conta até a DER
+      // Valida indicadores: PSC-MEN-SM e PREC-MENOR-MIN não contam
+      var inds = c.indicadores || '';
+      var indStr = typeof inds === 'string' ? inds : (Array.isArray(inds) ? inds.join(' ') : '');
+      if (/PSC-MEN-SM|PREC-MENOR-MIN/.test(indStr)) return;
+      if (!ultimaData || dc > ultimaData) { ultimaData = dc; ultimaComp = c.comp; }
+    });
+  }
+  // Fallback para o valor armazenado (caso não haja _contribuicoesDetalhadas)
+  if (!ultimaData) {
+    var fb = cnis._ultimaContribuicaoValida || cnis._ultimoVinculo;
+    ultimaData = _parseComp(fb);
+  }
+
+  // Verifica se tem vínculo ATIVO NA DATA DE REFERÊNCIA (não só "hoje")
   var temVinculoAberto = (cnis._vinculos || []).some(function(v) {
-    return !v.fim || /aberto|atual|vigente/i.test(v.fim);
+    // Parsa data início/fim
+    function pd(s) {
+      if (!s) return null;
+      var p = (s || '').split('/');
+      if (p.length !== 3) return null;
+      return new Date(parseInt(p[2]), parseInt(p[1]) - 1, parseInt(p[0]));
+    }
+    var ini = pd(v.inicio);
+    var fimAberto = !v.fim || /aberto|atual|vigente/i.test(v.fim);
+    if (!ini) return false;
+    if (ini > ref) return false; // vínculo ainda não começou na DER
+    if (fimAberto) return true;  // aberto, e já havia iniciado → ATIVO na DER
+    var fim = pd(v.fim);
+    if (fim && fim >= ref) return true; // fim posterior à DER → ativo na DER
+    return false;
   });
 
   if (temVinculoAberto) {
     return {
       status: 'ativo',
-      desc: 'Possui vínculo empregatício ATIVO. Qualidade de segurado preservada automaticamente.',
+      desc: 'Possui vínculo empregatício ATIVO na DER (' + _fmtData(ref) + '). Qualidade de segurado preservada.',
       meta: 'VÍNCULO VIGENTE',
     };
   }
 
   if (!ultimaData) {
-    return { status: 'indefinido', desc: 'Não foi possível identificar a última contribuição.' };
+    return { status: 'indefinido', desc: 'Não foi possível identificar a última contribuição antes da DER (' + _fmtData(ref) + ').' };
   }
 
-  // Calcula meses desde última contribuição
-  var mesesDesde = (hoje.getFullYear() - ultimaData.getFullYear()) * 12
-                 + (hoje.getMonth() - ultimaData.getMonth());
+  // Meses entre última contribuição e DATA DE REFERÊNCIA (não "hoje")
+  var mesesDesde = (ref.getFullYear() - ultimaData.getFullYear()) * 12
+                 + (ref.getMonth() - ultimaData.getMonth());
+  if (mesesDesde < 0) mesesDesde = 0;
 
-  // Período de graça:
-  // - Regra geral: 12 meses
-  // - +12 meses se tiver >120 contribuições: 24 meses
-  // - +12 se comprovar desemprego: 36 meses
-  var totalContrib = cnis._totalContribuicoesValidas || cnis._totalContribuicoes || 0;
+  // Conta total de contribuições VÁLIDAS até a DER (para definir base de graça 12 vs 24)
+  var totalContribAteDer = 0;
+  if (cnis._contribuicoesDetalhadas) {
+    cnis._contribuicoesDetalhadas.forEach(function(c) {
+      if (!c || !c.comp) return;
+      var parts = c.comp.split('/');
+      if (parts.length !== 2) return;
+      var dc = new Date(parseInt(parts[1]), parseInt(parts[0]) - 1, 15);
+      if (dc > ref) return;
+      var indStr = typeof c.indicadores === 'string' ? c.indicadores : (Array.isArray(c.indicadores) ? c.indicadores.join(' ') : '');
+      if (/PSC-MEN-SM|PREC-MENOR-MIN/.test(indStr)) return;
+      totalContribAteDer++;
+    });
+  }
+
+  // Período de graça (art. 15 da Lei 8.213/91):
+  //   I - sem limite: aposentado
+  //   II - 12 meses: após cessação do benefício por incapacidade ou deixar de exercer atividade
+  //   II+§1º - 24 meses: se tiver pago mais de 120 contribuições sem perda de qualidade
+  //   §2º - +12 meses se comprovar desemprego involuntário (SINE ou MTE)
   var gracaBase = 12;
-  if (totalContrib >= 120) gracaBase = 24;
-  var gracaMaxComDesemprego = gracaBase + 12; // 24 ou 36
+  if (totalContribAteDer >= 120) gracaBase = 24;
+  var gracaMaxComDesemprego = gracaBase + 12;
 
   if (mesesDesde <= gracaBase) {
     var restam = gracaBase - mesesDesde;
     return {
       status: 'graca',
-      desc: 'Em período de graça. Última contribuição: ' + _fmtData(ultimaData) + '. Restam ' + restam + ' meses na graça normal' + (gracaBase === 24 ? ' (24 meses por ter >120 contribuições)' : '') + '.',
+      desc: 'Em período de graça na DER (' + _fmtData(ref) + '). Última contribuição válida: ' + _fmtData(ultimaData) + '. Restam ' + restam + ' meses na graça normal' + (gracaBase === 24 ? ' (24 meses por ter ≥ 120 contribuições)' : '') + '.',
       meta: 'RESTAM ' + restam + ' MESES',
     };
   }
@@ -3139,14 +3194,14 @@ function _calcularQualidadeSegurado(ctx) {
     var restam2 = gracaMaxComDesemprego - mesesDesde;
     return {
       status: 'graca',
-      desc: 'Graça prorrogada possível (requer comprovação de desemprego no Ministério do Trabalho). Última contribuição: ' + _fmtData(ultimaData) + '. Máximo ' + restam2 + ' meses se comprovado.',
+      desc: 'Graça prorrogada possível na DER (' + _fmtData(ref) + ') — requer comprovação de desemprego no Ministério do Trabalho/SINE. Última contribuição: ' + _fmtData(ultimaData) + '. Máximo ' + restam2 + ' meses se comprovado.',
       meta: 'GRAÇA ESTENDIDA — COMPROVAR DESEMPREGO',
     };
   }
 
   return {
     status: 'perdeu',
-    desc: 'Qualidade de segurado PERDIDA. Última contribuição: ' + _fmtData(ultimaData) + ' (' + mesesDesde + ' meses atrás). Para recuperar direitos: contribuir 6 meses (metade da carência) para benefícios por incapacidade.',
+    desc: 'Qualidade de segurado PERDIDA na DER (' + _fmtData(ref) + '). Última contribuição: ' + _fmtData(ultimaData) + ' (' + mesesDesde + ' meses antes da DER). Para recuperar: contribuir 6 meses (metade da carência) para benefícios por incapacidade.',
     meta: mesesDesde + ' MESES SEM CONTRIBUIR',
   };
 }
@@ -10385,6 +10440,541 @@ setTimeout(function() {
 }, 1300);
 
 console.log('[A&P Plan] Módulo Edição de Contribuições v1 carregado');
+
+})();
+</script>
+
+
+<!-- ═══════════════════════════════════════════════════════════════
+     MÓDULO RMI NÃO-PROGRAMÁVEIS v1
+     ───────────────────────────────────────────────────────────────
+     Calcula RMI estimada de:
+       - Auxílio-doença (91% da média, art. 61 Lei 8.213/91)
+       - Salário-maternidade (última remuneração, art. 72 Lei 8.213/91)
+       - Pensão por morte (100% + cotas por dependente, Lei 13.135/15)
+       - Aposentadoria por invalidez (100% da média, art. 44 Lei 8.213/91)
+
+     Base de cálculo (art. 26 EC 103/2019 + art. 29 Lei 8.213/91):
+       - PBC: 07/1994 até a DER
+       - Atualização: INPC (mesmo de aposentadoria)
+       - Média aritmética de 100% dos SCs válidos (pós EC 103)
+
+     Depende: window.AP_Plan.calcularRMI (para reutilizar média já validada)
+     ═══════════════════════════════════════════════════════════════ -->
+<style>
+.p3-naoprog-rmi {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--gold);
+  font-weight: 500;
+  margin-top: 3px;
+  letter-spacing: .02em;
+}
+.p3-naoprog-rmi.sem { color: var(--muted); font-style: italic; font-weight: normal; }
+.p3-naoprog-rmi-detalhe {
+  font-family: var(--sans);
+  font-size: 10.5px;
+  color: var(--muted2);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+@media print {
+  .p3-naoprog-rmi { color: #8a7028 !important; }
+  .p3-naoprog-rmi-detalhe { color: #666 !important; }
+}
+</style>
+
+<script>
+(function() {
+'use strict';
+
+if (window._apRmiNaoProgInstalled) return;
+window._apRmiNaoProgInstalled = true;
+
+// ──────────────────────────────────────────────────────────
+// UTILS
+// ──────────────────────────────────────────────────────────
+
+function _fmtMoeda(v) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  return 'R$ ' + Number(v).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d)\,)/g, '.');
+}
+function _parseComp(s) {
+  if (!s || typeof s !== 'string') return null;
+  var m = s.match(/^(\d{2})\/(\d{4})$/);
+  if (!m) return null;
+  return new Date(parseInt(m[2]), parseInt(m[1]) - 1, 15);
+}
+
+// ──────────────────────────────────────────────────────────
+// CALCULO DA MÉDIA (reaproveita lógica do módulo RMI)
+// ──────────────────────────────────────────────────────────
+
+function _calcularMediaParaNaoProg(ctx) {
+  // Estratégia: chamar calcularRMI com uma regra fake "Regra Nova"
+  // e extrair só o campo `media`. Isso reusa toda a lógica de PBC,
+  // INPC, filtragem de PSC-MEN-SM, teto INSS — 100% validada.
+  if (!window.AP_Plan || !window.AP_Plan.calcularRMI) return null;
+  var regraFake = { nome: 'Regra Nova', temDireito: true };
+  try {
+    var r = window.AP_Plan.calcularRMI(regraFake, ctx);
+    if (r && !r.erro && r.media) {
+      return {
+        media: r.media,
+        qtdSCs: r.qtdSCs,
+        metodoMedia: r.metodoMedia,
+      };
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Última remuneração VÁLIDA antes da DER (para salário-maternidade)
+function _ultimaRemuneracao(ctx) {
+  var cnis = ctx && ctx.cnisOriginal;
+  if (!cnis || !cnis._contribuicoesDetalhadas) return null;
+  var ref = ctx.der instanceof Date ? ctx.der : new Date();
+
+  var candidatas = [];
+  cnis._contribuicoesDetalhadas.forEach(function(c) {
+    if (!c || !c.comp || !c.valor) return;
+    var d = _parseComp(c.comp);
+    if (!d || d > ref) return;
+    var inds = typeof c.indicadores === 'string' ? c.indicadores
+      : (Array.isArray(c.indicadores) ? c.indicadores.join(' ') : '');
+    if (/PSC-MEN-SM|PREC-MENOR-MIN/.test(inds)) return;
+    candidatas.push({ comp: c.comp, data: d, valor: c.valor });
+  });
+  if (!candidatas.length) return null;
+  candidatas.sort(function(a, b) { return b.data - a.data; });
+  return candidatas[0]; // a mais recente
+}
+
+// ──────────────────────────────────────────────────────────
+// CÁLCULOS ESPECÍFICOS POR BENEFÍCIO
+// ──────────────────────────────────────────────────────────
+
+function _smDoAno(ano) {
+  var t = window.SALARIO_MINIMO_HISTORICO || {};
+  return t[ano] || t[2025] || 1518;
+}
+function _tetoInss(ano) {
+  // Tabela simples (teto INSS ano vigente)
+  var t = {
+    2019: 5839.45, 2020: 6101.06, 2021: 6433.57, 2022: 7087.22,
+    2023: 7507.49, 2024: 7786.02, 2025: 8157.41, 2026: 8500.00,
+  };
+  return t[ano] || t[2025] || 8000;
+}
+
+/**
+ * Auxílio por Incapacidade Temporária (auxílio-doença)
+ * Art. 61 Lei 8.213/91:
+ *   RMI = 91% da média
+ *   Limitado a 100% da média dos últimos 12 salários de contribuição (art. 29, §10)
+ *     (proteção: não pode superar média dos últimos 12m — regra "teto do auxílio")
+ */
+function _calcularAuxilioDoenca(ctx, base) {
+  if (!base) return { erro: 'Sem base de cálculo' };
+  var media = base.media;
+  var rmi = media * 0.91;
+  var teto12 = _calcularMediaUltimos12(ctx);
+  var aplicouTeto12 = false;
+  if (teto12 && rmi > teto12) {
+    rmi = teto12;
+    aplicouTeto12 = true;
+  }
+  var derAno = ctx.der.getFullYear();
+  var pisoSM = _smDoAno(derAno);
+  var tetoInss = _tetoInss(derAno);
+  var limite = null;
+  if (rmi < pisoSM) { rmi = pisoSM; limite = 'piso'; }
+  else if (rmi > tetoInss) { rmi = tetoInss; limite = 'teto'; }
+  return {
+    rmi: rmi,
+    media: media,
+    coef: 0.91,
+    coefTxt: '91% da média (art. 61 Lei 8.213/91)',
+    qtdSCs: base.qtdSCs,
+    aplicouTeto12: aplicouTeto12,
+    teto12: teto12,
+    limite: limite,
+    piso: pisoSM,
+    teto: tetoInss,
+  };
+}
+
+/**
+ * Aposentadoria por Incapacidade Permanente (invalidez)
+ * Art. 44 Lei 8.213/91 + EC 103/2019:
+ *   RMI = 60% + 2%/ano após 20H/15M (coef EC 103)
+ *   EXCETO: se decorrer de acidente do trabalho, doença profissional
+ *           ou doenças taxativas → 100% da média
+ */
+function _calcularInvalidez(ctx, base, decorrenteDeAcidente) {
+  if (!base) return { erro: 'Sem base de cálculo' };
+  var media = base.media;
+  var coef, coefTxt;
+  if (decorrenteDeAcidente) {
+    coef = 1.0;
+    coefTxt = '100% (acidente/doença profissional — art. 26, §3º, III EC 103)';
+  } else {
+    var tempoAnos = (ctx.tempoContribMeses || 0) / 12;
+    var tempoMin = ctx.sexo === 'feminino' ? 15 : 20;
+    var extra = Math.max(0, tempoAnos - tempoMin);
+    coef = 0.60 + extra * 0.02;
+    if (coef > 1.0) coef = 1.0;
+    coefTxt = '60% + 2%/ano após ' + tempoMin + 'a (regra comum) → ' + (coef * 100).toFixed(0) + '%';
+  }
+  var rmi = media * coef;
+  var derAno = ctx.der.getFullYear();
+  var pisoSM = _smDoAno(derAno);
+  var tetoInss = _tetoInss(derAno);
+  var limite = null;
+  if (rmi < pisoSM) { rmi = pisoSM; limite = 'piso'; }
+  else if (rmi > tetoInss) { rmi = tetoInss; limite = 'teto'; }
+  return {
+    rmi: rmi,
+    media: media,
+    coef: coef,
+    coefTxt: coefTxt,
+    qtdSCs: base.qtdSCs,
+    limite: limite,
+    piso: pisoSM,
+    teto: tetoInss,
+  };
+}
+
+/**
+ * Salário-Maternidade
+ * Art. 72 Lei 8.213/91:
+ *   - Empregada / trabalhadora avulsa: remuneração integral do mês do afastamento
+ *   - Empregada doméstica: último salário de contribuição
+ *   - CI / facultativa: 1/12 da soma dos 12 últimos salários apurados em PBC ≥ 15 meses
+ *   - Rural (seg. especial): 1 SM
+ * Piso: SM | Teto: teto INSS (exceto para empregada com vínculo ativo, que recebe salário integral)
+ */
+function _calcularSalarioMaternidade(ctx) {
+  var cnis = ctx.cnisOriginal;
+  if (!cnis) return { erro: 'Sem CNIS' };
+  var derAno = ctx.der.getFullYear();
+  var pisoSM = _smDoAno(derAno);
+  var tetoInss = _tetoInss(derAno);
+
+  // Detecta tipo da segurada
+  var tipoSeg = 'ci'; // default contribuinte individual / facultativa
+  var tipoTxt = 'CI/facultativa';
+  // Verifica vínculo EMPREGADA ativo na DER
+  var ref = ctx.der;
+  function pd(s) {
+    if (!s) return null;
+    var p = (s || '').split('/');
+    if (p.length !== 3) return null;
+    return new Date(parseInt(p[2]), parseInt(p[1]) - 1, parseInt(p[0]));
+  }
+  var vincAtivo = (cnis._vinculos || []).find(function(v) {
+    var ini = pd(v.inicio);
+    var fimAberto = !v.fim || /aberto|atual|vigente/i.test(v.fim);
+    if (!ini || ini > ref) return false;
+    if (fimAberto) return true;
+    var fim = pd(v.fim);
+    return fim && fim >= ref;
+  });
+  if (vincAtivo) {
+    var tipoVinc = (vincAtivo.tipo || '').toLowerCase();
+    if (/empregad/i.test(tipoVinc) || /agente.p[uú]blico/i.test(tipoVinc)) {
+      tipoSeg = 'empregada';
+      tipoTxt = 'Empregada (vínculo ativo)';
+    }
+  }
+
+  // Cálculo por tipo
+  var rmi, coefTxt;
+  if (tipoSeg === 'empregada') {
+    // Recebe salário integral do mês. Pega a última remuneração válida.
+    var ultima = _ultimaRemuneracao(ctx);
+    if (!ultima) return { erro: 'Sem remuneração para base' };
+    rmi = ultima.valor;
+    coefTxt = 'Salário integral do mês (' + ultima.comp + ') — empregada';
+  } else {
+    // CI/facultativa: 1/12 da soma dos últimos 12 SC em PBC ≥ 15 meses
+    var ultimos12 = _calcularMediaUltimos12(ctx);
+    if (ultimos12) {
+      rmi = ultimos12;
+      coefTxt = 'Média dos últimos 12 SCs (CI/facultativa) — art. 72, §3º Lei 8.213/91';
+    } else {
+      // Sem contribuições suficientes — vai no piso (SM)
+      rmi = pisoSM;
+      coefTxt = 'Sem 12 contribuições válidas — aplicado piso (1 SM)';
+    }
+  }
+
+  var limite = null;
+  if (rmi < pisoSM) { rmi = pisoSM; limite = 'piso'; }
+  else if (rmi > tetoInss && tipoSeg !== 'empregada') { rmi = tetoInss; limite = 'teto'; }
+
+  return {
+    rmi: rmi,
+    tipoSegurada: tipoSeg,
+    tipoTxt: tipoTxt,
+    coefTxt: coefTxt,
+    limite: limite,
+    piso: pisoSM,
+    teto: tetoInss,
+  };
+}
+
+/**
+ * Pensão por Morte (Lei 13.135/2015 + EC 103/2019)
+ *   RMI de REFERÊNCIA = 100% da aposentadoria que o instituidor recebia / teria direito
+ *   Valor FINAL ao dependente: 50% + 10% por dependente (até 100%)
+ *       - cônjuge / companheiro
+ *       - filho menor de 21 ou inválido (cada)
+ *       - pais / outros dependentes (se habilitados)
+ */
+function _calcularPensaoPorMorte(ctx, base, qtdDependentes) {
+  if (!base) return { erro: 'Sem base de cálculo' };
+  var media = base.media;
+  // 100% da média (como se fosse aposentadoria por invalidez — regra geral)
+  var tempoAnos = (ctx.tempoContribMeses || 0) / 12;
+  var tempoMin = ctx.sexo === 'feminino' ? 15 : 20;
+  var extra = Math.max(0, tempoAnos - tempoMin);
+  var coefAposent = 0.60 + extra * 0.02;
+  if (coefAposent > 1.0) coefAposent = 1.0;
+  var rmiBase = media * coefAposent;
+
+  // Cotas: 50% + 10% por dependente, limitado a 100%
+  var qtd = qtdDependentes || 1;
+  var coefCota = 0.50 + 0.10 * qtd;
+  if (coefCota > 1.0) coefCota = 1.0;
+  var rmi = rmiBase * coefCota;
+
+  var derAno = ctx.der.getFullYear();
+  var pisoSM = _smDoAno(derAno);
+  var tetoInss = _tetoInss(derAno);
+  var limite = null;
+  if (rmi < pisoSM) { rmi = pisoSM; limite = 'piso'; }
+  else if (rmi > tetoInss) { rmi = tetoInss; limite = 'teto'; }
+
+  return {
+    rmi: rmi,
+    rmiBase: rmiBase,
+    media: media,
+    coefAposent: coefAposent,
+    coefCota: coefCota,
+    qtdDependentes: qtd,
+    coefTxt: '50% + 10%/dep (' + qtd + ' dep) = ' + (coefCota * 100).toFixed(0) + '% sobre base',
+    qtdSCs: base.qtdSCs,
+    limite: limite,
+    piso: pisoSM,
+    teto: tetoInss,
+  };
+}
+
+// Média dos últimos 12 salários de contribuição válidos até a DER
+function _calcularMediaUltimos12(ctx) {
+  var cnis = ctx.cnisOriginal;
+  if (!cnis || !cnis._contribuicoesDetalhadas) return null;
+  var ref = ctx.der;
+  var validas = [];
+  cnis._contribuicoesDetalhadas.forEach(function(c) {
+    if (!c || !c.comp || !c.valor) return;
+    var d = _parseComp(c.comp);
+    if (!d || d > ref) return;
+    var inds = typeof c.indicadores === 'string' ? c.indicadores
+      : (Array.isArray(c.indicadores) ? c.indicadores.join(' ') : '');
+    if (/PSC-MEN-SM|PREC-MENOR-MIN/.test(inds)) return;
+    validas.push({ data: d, valor: c.valor });
+  });
+  if (validas.length < 1) return null;
+  // Ordena desc
+  validas.sort(function(a, b) { return b.data - a.data; });
+  var ultimos = validas.slice(0, 12);
+  var soma = ultimos.reduce(function(acc, x) { return acc + x.valor; }, 0);
+  return soma / ultimos.length;
+}
+
+// ──────────────────────────────────────────────────────────
+// API PÚBLICA
+// ──────────────────────────────────────────────────────────
+
+function calcularRmiNaoProg(tipo, ctx, opts) {
+  opts = opts || {};
+  // Base de cálculo comum (média)
+  var base = _calcularMediaParaNaoProg(ctx);
+
+  switch (tipo) {
+    case 'auxilio_doenca':
+      return _calcularAuxilioDoenca(ctx, base);
+    case 'invalidez':
+      return _calcularInvalidez(ctx, base, opts.acidentario);
+    case 'salario_maternidade':
+      return _calcularSalarioMaternidade(ctx);
+    case 'pensao_morte':
+      return _calcularPensaoPorMorte(ctx, base, opts.qtdDependentes || 1);
+    default:
+      return { erro: 'Tipo não implementado: ' + tipo };
+  }
+}
+
+window.AP_Plan = window.AP_Plan || {};
+window.AP_Plan.calcularRmiNaoProg = calcularRmiNaoProg;
+
+console.log('[A&P Plan] Módulo RMI Não-Programáveis v1 carregado');
+
+})();
+</script>
+
+
+<!-- ═══════════════════════════════════════════════════════════════
+     PATCH: injetar RMI nos cards de não-programáveis
+     ═══════════════════════════════════════════════════════════════ -->
+<script>
+(function() {
+'use strict';
+
+if (window._apRmiNaoProgRenderInstalled) return;
+window._apRmiNaoProgRenderInstalled = true;
+
+// Mapa: nome do benefício → tipo esperado pela API
+var MAPA_TIPO = {
+  'Auxílio por Incapacidade Temporária':       'auxilio_doenca',
+  'Aposentadoria por Incapacidade Permanente': 'invalidez',
+  'Salário-Maternidade':                        'salario_maternidade',
+  'Pensão por Morte (dependentes)':             'pensao_morte',
+};
+
+function _fmtMoeda(v) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  return 'R$ ' + Number(v).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d)\,)/g, '.');
+}
+
+function _obterCtx() {
+  var dados = window.dadosExtraidos || {};
+  var todos = window._todosDocumentosDados || [];
+  var cnis = (todos || []).find(function(d) {
+    return d && (d._tipoDetectado === 'cnis' || /cnis|extrato/i.test(d.tipoDocumento || ''));
+  }) || dados;
+
+  var der = new Date();
+  var derInput = document.getElementById('p3-der-input');
+  if (derInput && derInput.value) {
+    var m = derInput.value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) der = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+  }
+  var parseBR = function(s) {
+    if (!s || typeof s !== 'string') return null;
+    var m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    return m ? new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1])) : null;
+  };
+  var nasc = parseBR(dados.dataNascimento || cnis.dataNascimento);
+  var idadeMeses = nasc
+    ? ((der.getFullYear() - nasc.getFullYear()) * 12 + (der.getMonth() - nasc.getMonth()))
+    : 0;
+  var sexo = (function() {
+    var n = (dados.nomeCliente || cnis.nomeCliente || '').split(' ')[0];
+    return /a$/i.test(n) ? 'feminino' : 'masculino';
+  })();
+
+  // Tempo e carência ATÉ a DER (replica lógica do módulo Tramitação)
+  var tempoAteDer = 0, carenciaAteDer = 0;
+  if (cnis && cnis._contribuicoesDetalhadas) {
+    cnis._contribuicoesDetalhadas.forEach(function(c) {
+      var parts = (c.comp || '').split('/');
+      if (parts.length !== 2) return;
+      var dc = new Date(parseInt(parts[1]), parseInt(parts[0]) - 1, 15);
+      if (dc > der) return;
+      tempoAteDer++;
+      var inds = typeof c.indicadores === 'string' ? c.indicadores
+        : (Array.isArray(c.indicadores) ? c.indicadores.join(' ') : '');
+      if (!/PSC-MEN-SM|PREC-MENOR-MIN/.test(inds)) carenciaAteDer++;
+    });
+  }
+
+  return {
+    sexo: sexo, der: der,
+    idadeAtualMeses: idadeMeses,
+    tempoContribMeses: tempoAteDer,
+    carencia: carenciaAteDer,
+    cnisOriginal: cnis,
+    _temCnis: !!(cnis && cnis._vinculos && cnis._vinculos.length),
+  };
+}
+
+function _injetarRmi() {
+  if (!window.AP_Plan || !window.AP_Plan.calcularRmiNaoProg) return;
+  var ctx = _obterCtx();
+  if (!ctx._temCnis) return;
+
+  var items = document.querySelectorAll('.p3-naoprog-item');
+  if (!items.length) return;
+
+  items.forEach(function(item) {
+    // Já tem RMI? Pula
+    if (item.querySelector('.p3-naoprog-rmi')) return;
+
+    var nomeEl = item.querySelector('.p3-naoprog-nome');
+    if (!nomeEl) return;
+    var nome = nomeEl.textContent.trim();
+    var tipo = MAPA_TIPO[nome];
+    if (!tipo) return; // BPC não tem RMI calculada (é de 1 SM)
+
+    // Status do card: se "sem direito" ou "—", não mostra RMI
+    var statusEl = item.querySelector('.p3-naoprog-status');
+    var statusCls = statusEl && statusEl.className || '';
+    if (/\bnao\b/.test(statusCls)) {
+      // Sem qualidade de segurado — mostra "sem cálculo"
+      var semHtml = '<div class="p3-naoprog-rmi sem">RMI indisponível — sem qualidade de segurado na DER</div>';
+      nomeEl.parentElement.insertAdjacentHTML('beforeend', semHtml);
+      return;
+    }
+
+    var r;
+    try {
+      r = window.AP_Plan.calcularRmiNaoProg(tipo, ctx, { qtdDependentes: 1 });
+    } catch (e) {
+      console.warn('[A&P] RMI não-prog falhou:', nome, e);
+      return;
+    }
+    if (!r || r.erro) return;
+
+    var detalhe = '';
+    if (tipo === 'auxilio_doenca') {
+      detalhe = r.coefTxt + (r.aplicouTeto12 ? ' · limitado à média dos últimos 12' : '');
+    } else if (tipo === 'salario_maternidade') {
+      detalhe = r.tipoTxt + ' · ' + r.coefTxt;
+    } else if (tipo === 'pensao_morte') {
+      detalhe = r.coefTxt + ' (estimativa c/ 1 dependente)';
+    } else {
+      detalhe = r.coefTxt || '';
+    }
+    if (r.limite === 'piso') detalhe += ' · piso SM';
+    if (r.limite === 'teto') detalhe += ' · teto INSS';
+
+    var html = '<div class="p3-naoprog-rmi">'
+             +   '~ ' + _fmtMoeda(r.rmi) + ' estimado'
+             + '</div>'
+             + '<div class="p3-naoprog-rmi-detalhe">' + detalhe + '</div>';
+    nomeEl.parentElement.insertAdjacentHTML('beforeend', html);
+  });
+}
+
+// Hook render
+var _renderPrev = window.renderPlanejamento;
+window.renderPlanejamento = function() {
+  if (typeof _renderPrev === 'function') {
+    try { _renderPrev.apply(this, arguments); } catch (e) {}
+  }
+  // Delay maior que o de Tramitação (80) e Didáticas (160) para pegar DOM já pronto
+  setTimeout(_injetarRmi, 240);
+};
+
+setTimeout(function() {
+  if (typeof window.renderPlanejamento === 'function') _injetarRmi();
+}, 1500);
+
+console.log('[A&P Plan] Módulo RMI Não-Prog — render carregado');
 
 })();
 </script>
